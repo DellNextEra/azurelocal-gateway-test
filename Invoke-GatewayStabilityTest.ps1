@@ -86,13 +86,13 @@ function Get-SubnetMaskIntFromPrefix {
     if ($PrefixLength -lt 0 -or $PrefixLength -gt 32) {
         throw "Invalid PrefixLength: $PrefixLength"
     }
+    if ($PrefixLength -eq 0) { return [uint32]0 }
 
-    # Build the mask bit-by-bit into a UInt32 (safe across PS versions)
-    [uint32]$mask = 0
-    for ($i = 0; $i -lt $PrefixLength; $i++) {
-        $mask = $mask -bor ([uint32]1 -shl (31 - $i))
-    }
-    return $mask
+    # Use UInt64 throughout to avoid signed/negative behavior in Windows PowerShell 5.1
+    [uint64]$allOnes = 4294967295   # 0xFFFFFFFF as an unsigned value
+    [uint64]$mask64  = ($allOnes -shl (32 - $PrefixLength)) -band $allOnes
+
+    return [uint32]$mask64
 }
 
 function Get-NicContext {
@@ -118,7 +118,7 @@ function Get-NicContext {
     $maskInt  = (Get-SubnetMaskIntFromPrefix $ipObj.PrefixLength)
     $ipInt    = Convert-IPv4ToInt $ipObj.IPAddress
     $netInt   = $ipInt -band $maskInt
-    $invMask  = ([uint32]0xFFFFFFFF) -bxor $maskInt
+    $invMask  = ([uint32]::MaxValue) -bxor $maskInt
     $bcastInt = $netInt -bor $invMask
 
     [pscustomobject]@{
