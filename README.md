@@ -7,4 +7,4 @@ Requires 3 consecutive successful replies before reporting stability and removin
 > Review the script before running in production environments.
 
 ```powershell
-irm "https://raw.githubusercontent.com/<USER>/<REPO>/main/Invoke-GatewayStabilityTest.ps1" | iex
+irm "https://raw.githubusercontent.com/DellNextEra/azurelocal-gateway-test/main/Invoke-GatewayStabilityTest.ps1" | iex
