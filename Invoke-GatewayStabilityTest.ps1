@@ -25,9 +25,9 @@ param(
 
 $ifAlias = "Integrated NIC 1 Port 1-1"
 
-# If HostOffsets is passed as strings, normalize to ints
-$hostOffsets = $HostOffsets | ForEach-Object { [int]$_ }
-``
+# Host offsets inside detected subnet (Network + 26..31)
+$hostOffsets = 26..31
+
 # Require this many consecutive replies before declaring "stable"
 $requiredConsecutiveSuccess = 3
 
@@ -36,7 +36,7 @@ $pollDelayMs   = 500
 $pingTimeoutMs = 500
 
 # Notification
-$beepOnStableSuccess = -not $NoBeep
+$beepOnStableSuccess = $true
 
 # -------- Logging --------
 $logDir  = "C:\Temp"
@@ -82,9 +82,17 @@ function Convert-IntToIPv4 {
 
 function Get-SubnetMaskIntFromPrefix {
     param([Parameter(Mandatory)][int]$PrefixLength)
-    if ($PrefixLength -lt 0 -or $PrefixLength -gt 32) { throw "Invalid PrefixLength: $PrefixLength" }
-    if ($PrefixLength -eq 0) { return [uint32]0 }
-    return [uint64]0xFFFFFFFF -shl (32 - $PrefixLength)
+
+    if ($PrefixLength -lt 0 -or $PrefixLength -gt 32) {
+        throw "Invalid PrefixLength: $PrefixLength"
+    }
+
+    # Build the mask bit-by-bit into a UInt32 (safe across PS versions)
+    [uint32]$mask = 0
+    for ($i = 0; $i -lt $PrefixLength; $i++) {
+        $mask = $mask -bor ([uint32]1 -shl (31 - $i))
+    }
+    return $mask
 }
 
 function Get-NicContext {
@@ -107,10 +115,11 @@ function Get-NicContext {
     $gw = $ipCfg.IPv4DefaultGateway.NextHop
     if (-not $gw) { throw "No IPv4 default gateway found on '$InterfaceAlias'." }
 
-    $maskInt  = [uint32](Get-SubnetMaskIntFromPrefix $ipObj.PrefixLength)
+    $maskInt  = (Get-SubnetMaskIntFromPrefix $ipObj.PrefixLength)
     $ipInt    = Convert-IPv4ToInt $ipObj.IPAddress
     $netInt   = $ipInt -band $maskInt
-    $bcastInt = $netInt -bor ([uint32]0xFFFFFFFF -bxor $maskInt)
+    $invMask  = ([uint32]0xFFFFFFFF) -bxor $maskInt
+    $bcastInt = $netInt -bor $invMask
 
     [pscustomobject]@{
         IPAddress    = $ipObj.IPAddress
