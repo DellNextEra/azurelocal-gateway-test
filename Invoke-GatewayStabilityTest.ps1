@@ -3,9 +3,11 @@ param(
   [Parameter(Mandatory=$false)]
   [string]$InterfaceAlias = "Integrated NIC 1 Port 1-1",
 
+  # Host offsets inside detected subnet (Network + offsets). Default: 26..31
   [Parameter(Mandatory=$false)]
-  [string[]]$HostOffsets = (26..31),
+  [int[]]$HostOffsets = (26..31),
 
+  # Require N consecutive replies before declaring stable and removing that IP
   [Parameter(Mandatory=$false)]
   [int]$RequiredConsecutiveSuccess = 3,
 
@@ -21,25 +23,17 @@ param(
   [Parameter(Mandatory=$false)]
   [switch]$NoBeep
 )
-# Run PowerShell as Administrator
 
-$ifAlias = "Integrated NIC 1 Port 1-1"
-
-# Host offsets inside detected subnet (Network + 26..31)
-$hostOffsets = 26..31
-
-# Require this many consecutive replies before declaring "stable"
-$requiredConsecutiveSuccess = 3
-
-# Timing
-$pollDelayMs   = 500
-$pingTimeoutMs = 500
-
-# Notification
-$beepOnStableSuccess = $true
+# ---------------- Effective settings (from params) ----------------
+$ifAlias                    = $InterfaceAlias
+$hostOffsets                = $HostOffsets | ForEach-Object { [int]$_ }
+$requiredConsecutiveSuccess = [int]$RequiredConsecutiveSuccess
+$pingTimeoutMs              = [int]$PingTimeoutMs
+$pollDelayMs                = [int]$PollDelayMs
+$beepOnStableSuccess        = -not $NoBeep
 
 # -------- Logging --------
-$logDir  = "C:\Temp"
+$logDir = $LogDirectory
 if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
 $logPath = Join-Path $logDir ("GatewayPing_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
@@ -51,7 +45,6 @@ function Write-Log {
     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line  = "{0} [{1}] {2}" -f $stamp, $Level, $Message
 
-    # Write to console (colored) + log file
     switch ($Level) {
         "SUCCESS" { Write-Host $line -ForegroundColor Green }
         "WARN"    { Write-Host $line -ForegroundColor Yellow }
@@ -64,20 +57,140 @@ function Write-Log {
 
 Write-Log "Starting gateway stability ping script. Log file: $logPath" "INFO"
 
+# ---------------- Self-check ----------------
+
+function Invoke-SelfCheck {
+    param([Parameter(Mandatory)][string]$InterfaceAlias)
+
+    $psv = $PSVersionTable.PSVersion.ToString()
+    $pse = $PSVersionTable.PSEdition
+    $os  = $PSVersionTable.OS
+
+    Write-Log "Self-check: PowerShell $pse $psv" "INFO"
+    if ($os) { Write-Log "Self-check: OS = $os" "INFO" }
+
+    # Determine Windows reliably across PS 5.1 and PS 7+
+    $isWindows = $false
+    if (Get-Variable -Name IsWindows -Scope Global -ErrorAction SilentlyContinue) {
+        $isWindows = [bool]$IsWindows
+    } else {
+        $isWindows = ($env:OS -eq "Windows_NT")
+    }
+
+    if (-not $isWindows) {
+        Write-Log "Self-check FAILED: This script requires Windows (NetTCPIP/NetAdapter cmdlets are Windows-only)." "ERROR"
+        throw "Unsupported OS"
+    }
+
+    # Must be elevated
+    $isAdmin = $false
+    try {
+        $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        Write-Log "Self-check FAILED: Could not determine elevation status: $($_.Exception.Message)" "ERROR"
+        throw
+    }
+
+    if (-not $isAdmin) {
+        Write-Log "Self-check FAILED: Not running as Administrator. Start PowerShell with 'Run as administrator'." "ERROR"
+        throw "Not elevated"
+    }
+    Write-Log "Self-check: Running elevated (Administrator) = True" "INFO"
+
+    # Required cmdlets
+    $requiredCmdlets = @(
+        "Get-NetIPAddress",
+        "Get-NetIPConfiguration",
+        "New-NetIPAddress",
+        "Remove-NetIPAddress",
+        "Get-NetAdapter"
+    )
+
+    # In PS 7+, attempt to load modules via compatibility if commands missing
+    $missing = @()
+    foreach ($c in $requiredCmdlets) {
+        if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { $missing += $c }
+    }
+
+    if ($missing.Count -gt 0 -and $pse -eq "Core") {
+        Write-Log "Self-check: Missing cmdlets detected in PowerShell Core. Attempting module import via Windows PowerShell compatibility..." "WARN"
+        try {
+            Import-Module NetTCPIP  -UseWindowsPowerShell -ErrorAction SilentlyContinue | Out-Null
+            Import-Module NetAdapter -UseWindowsPowerShell -ErrorAction SilentlyContinue | Out-Null
+        } catch { }
+
+        $missing = @()
+        foreach ($c in $requiredCmdlets) {
+            if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { $missing += $c }
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        Write-Log ("Self-check FAILED: Required commands not found: {0}" -f ($missing -join ", ")) "ERROR"
+        Write-Log "Tip: If using PowerShell 7, try: Import-Module NetTCPIP -UseWindowsPowerShell" "WARN"
+        throw "Missing required cmdlets"
+    }
+
+    Write-Log "Self-check: Required networking commands found." "INFO"
+
+    # Validate interface exists
+    $adapter = Get-NetAdapter -Name $InterfaceAlias -ErrorAction SilentlyContinue
+    if (-not $adapter) {
+        Write-Log "Self-check FAILED: InterfaceAlias '$InterfaceAlias' not found on this system." "ERROR"
+        Write-Log "Available adapters:" "INFO"
+        Get-NetAdapter | ForEach-Object { Write-Log (" - " + $_.Name) "INFO" }
+        throw "Bad InterfaceAlias"
+    }
+    Write-Log "Self-check: Found adapter '$InterfaceAlias' (Status=$($adapter.Status), LinkSpeed=$($adapter.LinkSpeed))." "INFO"
+
+    # Validate IP + prefix + gateway
+    $ipObj = Get-NetIPAddress -InterfaceAlias $InterfaceAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.AddressState -eq "Preferred" -and
+            $_.IPAddress -notlike "169.254.*" -and
+            $_.IPAddress -notlike "127.*"
+        } |
+        Select-Object -First 1
+
+    if (-not $ipObj) {
+        Write-Log "Self-check FAILED: No Preferred IPv4 address found on '$InterfaceAlias'." "ERROR"
+        throw "No Preferred IPv4"
+    }
+
+    Write-Log ("Self-check: IPv4 = {0}/{1} (State={2})" -f $ipObj.IPAddress, $ipObj.PrefixLength, $ipObj.AddressState) "INFO"
+
+    if ($ipObj.PrefixLength -eq 32) {
+        Write-Log "Self-check FAILED: PrefixLength is /32 on '$InterfaceAlias'. This will break routing/ARP. Fix NIC prefix (e.g. /24)." "ERROR"
+        throw "Bad PrefixLength /32"
+    }
+
+    $cfg = Get-NetIPConfiguration -InterfaceAlias $InterfaceAlias -ErrorAction SilentlyContinue
+    $gw  = $cfg.IPv4DefaultGateway.NextHop
+
+    if (-not $gw) {
+        Write-Log "Self-check FAILED: No IPv4 default gateway detected on '$InterfaceAlias'." "ERROR"
+        throw "No Default Gateway"
+    }
+
+    Write-Log "Self-check: Default Gateway = $gw" "INFO"
+    Write-Log "Self-check PASSED." "SUCCESS"
+}
+
 # ---------------- Helpers ----------------
 
 function Convert-IPv4ToInt {
     param([Parameter(Mandatory)][string]$IPv4)
     $bytes = [System.Net.IPAddress]::Parse($IPv4).GetAddressBytes()
     [Array]::Reverse($bytes)
-    [BitConverter]::ToUInt32($bytes, 0)
+    return [BitConverter]::ToUInt32($bytes, 0)
 }
 
 function Convert-IntToIPv4 {
     param([Parameter(Mandatory)][uint32]$Int)
     $bytes = [BitConverter]::GetBytes($Int)
     [Array]::Reverse($bytes)
-    ([System.Net.IPAddress]::new($bytes)).ToString()
+    return ([System.Net.IPAddress]::new($bytes)).ToString()
 }
 
 function Get-SubnetMaskIntFromPrefix {
@@ -88,9 +201,9 @@ function Get-SubnetMaskIntFromPrefix {
     }
     if ($PrefixLength -eq 0) { return [uint32]0 }
 
-    # Use UInt64 throughout to avoid signed/negative behavior in Windows PowerShell 5.1
-    [uint64]$allOnes = 4294967295   # 0xFFFFFFFF as an unsigned value
-    [uint64]$mask64  = ($allOnes -shl (32 - $PrefixLength)) -band $allOnes
+    # Safe across Windows PowerShell 5.1: keep math in UInt64 and clamp to 32-bit.
+    [uint64]$allOnes = 4294967295  # 0xFFFFFFFF as an unsigned decimal
+    [uint64]$mask64  = (($allOnes -shl (32 - $PrefixLength)) -band $allOnes)
 
     return [uint32]$mask64
 }
@@ -115,11 +228,18 @@ function Get-NicContext {
     $gw = $ipCfg.IPv4DefaultGateway.NextHop
     if (-not $gw) { throw "No IPv4 default gateway found on '$InterfaceAlias'." }
 
-    $maskInt  = (Get-SubnetMaskIntFromPrefix $ipObj.PrefixLength)
-    $ipInt    = Convert-IPv4ToInt $ipObj.IPAddress
-    $netInt   = $ipInt -band $maskInt
-    $invMask  = ([uint32]::MaxValue) -bxor $maskInt
-    $bcastInt = $netInt -bor $invMask
+    # --- PS 5.1-safe unsigned subnet math ---
+    [uint64]$allOnes = 4294967295
+
+    [uint32]$maskInt = Get-SubnetMaskIntFromPrefix $ipObj.PrefixLength
+    [uint32]$ipInt   = Convert-IPv4ToInt $ipObj.IPAddress
+
+    [uint64]$net64   = (([uint64]$ipInt -band [uint64]$maskInt) -band $allOnes)
+    [uint64]$inv64   = (($allOnes -bxor [uint64]$maskInt) -band $allOnes)
+    [uint64]$bcast64 = (([uint64]$net64 -bor [uint64]$inv64) -band $allOnes)
+
+    [uint32]$netInt   = [uint32]$net64
+    [uint32]$bcastInt = [uint32]$bcast64
 
     [pscustomobject]@{
         IPAddress    = $ipObj.IPAddress
@@ -187,6 +307,8 @@ function Get-PingTimeMs {
 # ---------------- Main ----------------
 
 try {
+    Invoke-SelfCheck -InterfaceAlias $ifAlias
+
     $ctx = Get-NicContext -InterfaceAlias $ifAlias
     $gateway = $ctx.Gateway
 
@@ -197,14 +319,16 @@ try {
     Write-Log ("Stability: {0} consecutive replies required before removal." -f $requiredConsecutiveSuccess) "INFO"
 
     # Validate offsets fit the subnet size
-    $usableHosts = $ctx.BroadcastInt - $ctx.NetworkInt - 1
+    [uint32]$usableHosts = $ctx.BroadcastInt - $ctx.NetworkInt - 1
     $maxOffset = ($hostOffsets | Measure-Object -Maximum).Maximum
-    if ($maxOffset -gt $usableHosts) {
+    if ([uint32]$maxOffset -gt $usableHosts) {
         throw "Host offset $maxOffset doesn't fit in subnet /$($ctx.PrefixLength). Usable host offsets are 1..$usableHosts."
     }
 
     # Build sources as Network + offsets
-    $sources = $hostOffsets | ForEach-Object { Convert-IntToIPv4 ($ctx.NetworkInt + $_) }
+    $sources = $hostOffsets | ForEach-Object {
+        Convert-IntToIPv4 ([uint32]($ctx.NetworkInt + [uint32]$_))
+    }
     Write-Log ("Sources: {0}" -f ($sources -join ", ")) "INFO"
 
     # Add source IPs to adapter with correct PrefixLength
